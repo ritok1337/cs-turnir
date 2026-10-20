@@ -7,6 +7,22 @@ cs-turnir — приложение: ссылка на турнир CS2 (Liquiped
 
 Каждая таблица также сохраняется в папку `results/` (CSV, открывается в Numbers/Excel).
 
+## Пример работы (проверено 21.10.2026)
+Ссылка: https://liquipedia.net/counterstrike/BLAST/Major/2025/Austin — эло найдено у 171 из 175 игроков, проверка заняла ~4 минуты.
+
+![Результат для BLAST Austin Major 2025](docs/screenshot-top.png)
+
+- Полный скриншот страницы: [docs/screenshot-austin-major.png](docs/screenshot-austin-major.png)
+- Таблица текстом: [docs/example-austin-major-2025.txt](docs/example-austin-major-2025.txt)
+- Таблица CSV: [docs/example-austin-major-2025.csv](docs/example-austin-major-2025.csv)
+
+Запуск без значка (терминал, любая ОС с Python 3.9+ и curl):
+```
+python3 app/elo_app.py demo                                   # тестовые данные
+python3 app/elo_app.py https://liquipedia.net/counterstrike/... # таблица в терминале
+python3 app/elo_app.py                                        # веб-страница http://localhost:8765
+```
+
 ## Как это работает
 - Составы берутся со страницы турнира на Liquipedia (тренеры не считаются).
 - FACEIT-профиль игрока — из его страницы на Liquipedia (поле faceitdb/faceit), эло — с faceit.com.
@@ -18,3 +34,4 @@ cs-turnir — приложение: ссылка на турнир CS2 (Liquiped
 - `app/demo_tournament.json` — тестовые данные
 - `Запустить CS Elo.app` — значок для запуска
 - `results/` — сохранённые таблицы
+- `docs/` — скриншоты и пример результата

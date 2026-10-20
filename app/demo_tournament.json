@@ -1,0 +1,26 @@
+{
+  "title": "Демо-турнир (тестовые данные, не настоящие)",
+  "teams": [
+    {"name": "Demo Wolves", "players": [
+      {"name": "alpha", "faceit_nick": "alpha", "elo": 4210, "level": 10},
+      {"name": "bravo", "faceit_nick": "bravo_cs", "elo": 3875, "level": 10},
+      {"name": "charlie", "faceit_nick": "charlie", "elo": 3540, "level": 10},
+      {"name": "delta", "faceit_nick": "delta", "elo": 3990, "level": 10},
+      {"name": "echo", "elo": null, "why": "тестовый игрок без FACEIT"}
+    ]},
+    {"name": "Demo Bears", "players": [
+      {"name": "fox", "faceit_nick": "fox", "elo": 2950, "level": 10},
+      {"name": "golf", "faceit_nick": "golf", "elo": 3120, "level": 10},
+      {"name": "hotel", "faceit_nick": "hotel", "elo": 2780, "level": 10},
+      {"name": "india", "faceit_nick": "india", "elo": 3305, "level": 10},
+      {"name": "juliet", "faceit_nick": "juliet", "elo": 2640, "level": 10}
+    ]},
+    {"name": "Demo Hawks", "players": [
+      {"name": "kilo", "faceit_nick": "kilo", "elo": 4480, "level": 10},
+      {"name": "lima", "faceit_nick": "lima", "elo": 3720, "level": 10},
+      {"name": "mike", "faceit_nick": "mike", "elo": 4015, "level": 10},
+      {"name": "november", "faceit_nick": "november", "elo": 3360, "level": 10},
+      {"name": "oscar", "faceit_nick": "oscar", "elo": 3910, "level": 10}
+    ]}
+  ]
+}

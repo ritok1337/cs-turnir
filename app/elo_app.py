@@ -192,17 +192,124 @@ def lp_faceit_refs(pages, log):
     return refs
 
 
+_user_cache = {}
+
+
+def faceit_user(uuid=None, nick=None):
+    """Профиль FACEIT по ID или точному нику (с кэшем)."""
+    key = ("id", uuid) if uuid else ("nick", (nick or "").lower())
+    if key in _user_cache:
+        return _user_cache[key]
+    if uuid:
+        p = faceit_get("/api/users/v1/users/" + uuid)
+    else:
+        p = faceit_get("/api/users/v1/nicknames/" + urllib.parse.quote(nick))
+    _user_cache[key] = p
+    if p:
+        _user_cache[("id", p.get("id"))] = p
+        _user_cache[("nick", (p.get("nickname") or "").lower())] = p
+    return p
+
+
+def _info(p, how):
+    cs2 = (p.get("games") or {}).get("cs2") or {}
+    return {"faceit_nick": p.get("nickname"), "elo": cs2.get("faceit_elo"),
+            "level": cs2.get("skill_level"), "how": how,
+            "faceit_id": p.get("id"), "friends": set(p.get("friends") or [])}
+
+
 def faceit_lookup(ref):
     p, how = None, ""
     if ref.get("uuid"):
-        p, how = faceit_get("/api/users/v1/users/" + ref["uuid"]), "id"
+        p, how = faceit_user(uuid=ref["uuid"]), "liquipedia"
     if not p and ref.get("nick"):
-        p, how = faceit_get("/api/users/v1/nicknames/" + urllib.parse.quote(ref["nick"])), "ник"
-    if not p:
-        return None
-    cs2 = (p.get("games") or {}).get("cs2") or {}
-    return {"faceit_nick": p.get("nickname"), "elo": cs2.get("faceit_elo"),
-            "level": cs2.get("skill_level"), "how": how}
+        p, how = faceit_user(nick=ref["nick"]), "liquipedia"
+    return _info(p, how) if p else None
+
+
+# ---------------------------------------------------------------- поиск тех, кого нет на Liquipedia
+_LEET = str.maketrans("103457$@", "ioeastsa")
+
+
+def norm_nick(s):
+    s = (s or "").lower().translate(_LEET)
+    return re.sub(r"[^a-z0-9а-яё]", "", s)
+
+
+def nick_similar(a, b):
+    import difflib
+    a, b = norm_nick(a), norm_nick(b)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if len(a) >= 3 and len(b) >= 3 and (a in b or b in a):
+        return 0.9
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _linked(p, known):
+    """Сколько уже найденных тиммейтов связано с этим аккаунтом дружбой на FACEIT."""
+    pid, friends = p.get("id"), set(p.get("friends") or [])
+    return sum(1 for k in known if pid in k["friends"] or k["faceit_id"] in friends)
+
+
+def resolve_missing(team, log):
+    """Ищем на FACEIT игроков без профиля. Засчитываем только тех, кто связан с командой."""
+    missing = [p for p in team["players"] if not isinstance(p.get("elo"), int)]
+    if not missing:
+        return
+    known = [p for p in team["players"] if p.get("faceit_id")]
+    used = {p["faceit_id"] for p in known}
+    log("FACEIT: ищу без Liquipedia в «%s»: %s" % (team["name"], ", ".join(p["name"] for p in missing)))
+
+    # Кандидаты: друзья нескольких тиммейтов сразу (самые надёжные) + состав FACEIT-команды
+    pool = []
+    if known:
+        counts = {}
+        for k in known:
+            for f in k["friends"]:
+                counts[f] = counts.get(f, 0) + 1
+        need = 2 if len(known) >= 2 else 1
+        common = sorted((f for f, c in counts.items() if c >= need and f not in used),
+                        key=lambda f: -counts[f])[:40]
+        pool.extend(common)
+    try:
+        code, body = http_get("https://www.faceit.com/api/searcher/v1/teams?" + urllib.parse.urlencode(
+            {"query": team["name"], "limit": "10"}), BROWSER_UA, 15)
+        for t in (json.loads(body).get("payload") or []) if code == 200 else []:
+            if t.get("game") == "cs2" and norm_nick(t.get("name")) == norm_nick(team["name"]):
+                pool.extend(m["id"] for m in t.get("members") or [] if m.get("id") not in used)
+    except ValueError:
+        pass
+    pool = list(dict.fromkeys(pool))
+
+    for p in missing:
+        best, best_score, how = None, 0.0, ""
+        # 1) Точный ник на FACEIT (как ваш поиск)
+        exact = faceit_user(nick=p["name"])
+        if exact and exact.get("id") not in used:
+            if known and _linked(exact, known):
+                best, best_score, how = exact, 2.0, "по нику, связан с тиммейтами"
+            else:
+                best, best_score, how = exact, 0.5, "по нику, связь с командой не подтверждена"
+        # 2) Похожий ник среди друзей тиммейтов и FACEIT-команды
+        if best_score < 2.0:
+            for fid in pool:
+                c = faceit_user(uuid=fid)
+                if not c or c.get("id") in used:
+                    continue
+                s = nick_similar(p["name"], c.get("nickname"))
+                if s >= 0.75 and 1.0 + s > best_score:
+                    best, best_score, how = c, 1.0 + s, "похожий ник среди друзей команды"
+        if best:
+            info = _info(best, how)
+            info["verified"] = best_score >= 1.0
+            p.update(info)
+            p.pop("why", None)
+            used.add(info["faceit_id"])
+            if info["verified"]:
+                known.append(info)
 
 
 def hltv_to_liquipedia(url, log):
@@ -280,17 +387,32 @@ def run_tournament(url, log=print):
                     p["why"] = "на Liquipedia не указан FACEIT"
                 else:
                     p["why"] = "FACEIT не отдал профиль"
+    for t in teams:
+        resolve_missing(t, log)
+    for t in teams:
+        for p in t["players"]:
+            if not isinstance(p.get("elo"), int) and p.get("why"):
+                p["why"] += "; на FACEIT по нику и через тиммейтов не найден"
     return finish(d["parse"]["title"], url, teams)
+
+
+def counted(p):
+    """Идёт в среднее: эло есть и аккаунт подтверждён (Liquipedia или связь с тиммейтами)."""
+    return isinstance(p.get("elo"), int) and p.get("verified", True)
 
 
 def finish(title, source, teams):
     for t in teams:
-        elos = [p["elo"] for p in t["players"] if isinstance(p.get("elo"), int)]
+        elos = [p["elo"] for p in t["players"] if counted(p)]
         t["avg"] = round(sum(elos) / len(elos)) if elos else None
+        for p in t["players"]:
+            p.pop("friends", None)
     teams.sort(key=lambda t: t["avg"] or -1, reverse=True)
     res = {"title": title, "source": source, "teams": teams,
            "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-           "found": sum(1 for t in teams for p in t["players"] if isinstance(p.get("elo"), int)),
+           "found": sum(1 for t in teams for p in t["players"] if counted(p)),
+           "unsure": sum(1 for t in teams for p in t["players"]
+                         if isinstance(p.get("elo"), int) and not counted(p)),
            "total": sum(len(t["players"]) for t in teams)}
     res["csv"] = save_csv(res)
     return res
@@ -302,19 +424,32 @@ def save_csv(res):
     path = os.path.join(RESULTS_DIR, "%s_%s.csv" % (datetime.date.today().isoformat(), slug))
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["Команда", "Игрок", "Ник на FACEIT", "Elo", "Уровень", "Среднее по команде"])
+        w.writerow(["Команда", "Игрок", "Ник на FACEIT", "Elo", "Уровень", "Как найден",
+                    "Учтён в среднем", "Среднее по команде"])
         for t in res["teams"]:
             for p in t["players"]:
                 w.writerow([t["name"], p["name"], p.get("faceit_nick") or "",
                             p["elo"] if p.get("elo") is not None else "не найден",
-                            p.get("level") or "", t["avg"] or ""])
+                            p.get("level") or "", HOW.get(p.get("how"), p.get("how") or ""),
+                            "да" if counted(p) else "нет", t["avg"] or ""])
     return path
+
+
+HOW = {"liquipedia": "профиль указан на Liquipedia"}
+
+
+def elo_text(p):
+    if counted(p):
+        return str(p["elo"])
+    if isinstance(p.get("elo"), int):
+        return "~%d" % p["elo"]  # найден по нику, но не подтверждён — в среднее не идёт
+    return "?"
 
 
 def text_table(res):
     lines = []
     for t in res["teams"]:
-        elos = " ".join(str(p["elo"]) if isinstance(p.get("elo"), int) else "?" for p in t["players"])
+        elos = " ".join(elo_text(p) for p in t["players"])
         lines.append("%s - %s (%s)" % (t["name"], elos, t["avg"] if t["avg"] else "?"))
     return "\n".join(lines)
 
@@ -336,7 +471,8 @@ button,.btn{padding:10px 16px;border:0;border-radius:8px;background:var(--acc);c
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:6px 6px;border-bottom:1px solid var(--line);vertical-align:top}
 tr:last-child td{border-bottom:0}th{font-size:14px}td.n,th.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .miss{color:var(--mut)}pre{white-space:pre-wrap;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px;font-size:13px}
-.err{background:var(--lo);border-color:transparent}.lvl{display:inline-block;min-width:20px;text-align:center;border-radius:4px;background:var(--line);font-size:11px;margin-left:6px}
+.err{background:var(--lo);border-color:transparent}td a{color:inherit;text-decoration:none}td a:hover{text-decoration:underline}
+.tag{font-size:11px;color:var(--mut)}.tag.warn{color:#c77700}.lvl{display:inline-block;min-width:20px;text-align:center;border-radius:4px;background:var(--line);font-size:11px;margin-left:6px}
 """
 
 
@@ -363,18 +499,26 @@ def result_html(res):
         for p in t["players"]:
             if isinstance(p.get("elo"), int):
                 nick = p.get("faceit_nick") or ""
+                link = "https://www.faceit.com/ru/players/" + urllib.parse.quote(nick)
                 alt = (' <span class="mut">(%s)</span>' % e(nick)) if nick and nick.lower() != p["name"].lower() else ""
                 lvl = '<span class="lvl">%s</span>' % p["level"] if p.get("level") else ""
-                cells.append("<tr><td>%s%s</td><td class=n>%d%s</td></tr>" % (e(p["name"]), alt, p["elo"], lvl))
+                tag = ""
+                if p.get("how") and p["how"] != "liquipedia":
+                    tag = '<div class="tag%s">%s</div>' % ("" if counted(p) else " warn", e(
+                        p["how"] + ("" if counted(p) else " — в среднее не входит")))
+                elo = ("%d" if counted(p) else "~%d") % p["elo"]
+                cells.append('<tr><td><a href="%s" target="_blank">%s</a>%s%s</td><td class=n>%s%s</td></tr>' % (
+                    e(link), e(p["name"]), alt, tag, elo, lvl))
             else:
                 why = (' <span class="mut" title="%s">ⓘ</span>' % e(p["why"])) if p.get("why") else ""
                 cells.append('<tr class="miss"><td>%s</td><td class=n>не найден%s</td></tr>' % (e(p["name"]), why))
         cards.append('<div class="card"><table><tr><th>%s</th><th class=n>%s</th></tr>%s</table></div>' % (
             e(t["name"]), ("сред. %s" % t["avg"]) if t["avg"] else "—", "".join(cells)))
-    return ('<h2>%s</h2><div class="mut">Эло найдено у %d из %d игроков · %s · таблица сохранена: %s</div>'
+    unsure = (" · ещё %d найдено только по нику (~, в среднее не входят)" % res["unsure"]) if res.get("unsure") else ""
+    return ('<h2>%s</h2><div class="mut">Эло найдено у %d из %d игроков%s · %s · таблица сохранена: %s</div>'
             '<div class="grid" style="margin-top:12px">%s</div>'
             '<h3>Коротко (можно скопировать)</h3><pre>%s</pre>' % (
-                e(res["title"]), res["found"], res["total"], e(res["date"]),
+                e(res["title"]), res["found"], res["total"], unsure, e(res["date"]),
                 e(os.path.relpath(res["csv"], ROOT)), "".join(cards), e(text_table(res))))
 
 
@@ -461,6 +605,6 @@ if __name__ == "__main__":
             sys.exit(1)
         print("\n" + res["title"])
         print(text_table(res))
-        print("\nНайдено: %d из %d. CSV: %s" % (res["found"], res["total"], res["csv"]))
+        print("\nНайдено: %d из %d, ещё %d только по нику (~). CSV: %s" % (res["found"], res["total"], res["unsure"], res["csv"]))
     else:
         serve(open_browser="--no-browser" not in sys.argv)

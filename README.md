@@ -1,7 +1,7 @@
 cs-turnir — приложение: ссылка на турнир CS2 (Liquipedia или HLTV) → таблица команд и игроков с текущим FACEIT Elo и средним по команде.
 
 ## Скачать (macOS)
-Готовая сборка: [GitHub Releases → cs-turnir-macos-v0.1.0.zip](https://github.com/ritok1337/cs-turnir/releases/latest). Распакуйте архив; нужен Python 3 (на Mac он ставится вместе с инструментами разработчика Xcode).
+Готовая сборка: [GitHub Releases → cs-turnir-macos-v0.2.0.zip](https://github.com/ritok1337/cs-turnir/releases/latest). Распакуйте архив; нужен Python 3 (на Mac он ставится вместе с инструментами разработчика Xcode).
 Программа не подписана Apple, поэтому при первом запуске: правый щелчок по «Запустить CS Elo.app» → «Открыть» → «Открыть» (или Системные настройки → Конфиденциальность и безопасность → «Всё равно открыть»).
 
 ## Как запустить

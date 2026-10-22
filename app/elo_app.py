@@ -256,10 +256,10 @@ def _linked(p, known):
 
 def resolve_missing(team, log):
     """Ищем на FACEIT игроков без профиля. Засчитываем только тех, кто связан с командой."""
-    missing = [p for p in team["players"] if not isinstance(p.get("elo"), int)]
+    missing = [p for p in team["players"] if not counted(p)]
     if not missing:
         return
-    known = [p for p in team["players"] if p.get("faceit_id")]
+    known = [p for p in team["players"] if p.get("faceit_id") and counted(p)]
     used = {p["faceit_id"] for p in known}
     log("FACEIT: ищу без Liquipedia в «%s»: %s" % (team["name"], ", ".join(p["name"] for p in missing)))
 
@@ -388,7 +388,12 @@ def run_tournament(url, log=print):
                 else:
                     p["why"] = "FACEIT не отдал профиль"
     for t in teams:
-        resolve_missing(t, log)
+        # Повторяем, пока находятся новые: каждый найденный приносит своих друзей в поиск
+        for _ in range(3):
+            before = sum(1 for p in t["players"] if counted(p))
+            resolve_missing(t, log)
+            if sum(1 for p in t["players"] if counted(p)) == before:
+                break
     for t in teams:
         for p in t["players"]:
             if not isinstance(p.get("elo"), int) and p.get("why"):

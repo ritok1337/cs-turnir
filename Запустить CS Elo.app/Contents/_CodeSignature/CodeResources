@@ -10,7 +10,15 @@
 		</data>
 		<key>Resources/Scripts/main.scpt</key>
 		<data>
-		SYghkBPohZE6EcibuaR9JLJrC4U=
+		Hrf5OwJmHSE+3pofOK4rUDzVZrg=
+		</data>
+		<key>Resources/app/demo_tournament.json</key>
+		<data>
+		xYg4YPlNOmSdeHbX45zd0w+rcg4=
+		</data>
+		<key>Resources/app/elo_app.py</key>
+		<data>
+		HqYok7xtlynoNuzQ6bKFsuxD58I=
 		</data>
 		<key>Resources/applet.icns</key>
 		<data>
@@ -38,11 +46,33 @@
 		<dict>
 			<key>hash</key>
 			<data>
-			SYghkBPohZE6EcibuaR9JLJrC4U=
+			Hrf5OwJmHSE+3pofOK4rUDzVZrg=
 			</data>
 			<key>hash2</key>
 			<data>
-			3EpRsRzoClompIIP18gv7Qhc0kGTwksdAHv2f4YoVT8=
+			uueoqRn5+dx4MmI76xaiefl3hDb2zzQ61yu1HycGxGA=
+			</data>
+		</dict>
+		<key>Resources/app/demo_tournament.json</key>
+		<dict>
+			<key>hash</key>
+			<data>
+			xYg4YPlNOmSdeHbX45zd0w+rcg4=
+			</data>
+			<key>hash2</key>
+			<data>
+			phxo3dlfsRNCLehn3Ce+gWlFjmMEVSoWHdGhEbS1fpg=
+			</data>
+		</dict>
+		<key>Resources/app/elo_app.py</key>
+		<dict>
+			<key>hash</key>
+			<data>
+			HqYok7xtlynoNuzQ6bKFsuxD58I=
+			</data>
+			<key>hash2</key>
+			<data>
+			Lk5Jh5Qyb+H8gvwPsldCxO0+joSvmTUa/qKmVb08qBg=
 			</data>
 		</dict>
 		<key>Resources/applet.icns</key>

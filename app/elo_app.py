@@ -20,9 +20,24 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RESULTS_DIR = os.path.join(ROOT, "results")
-DEMO_FILE = os.path.join(ROOT, "app", "demo_tournament.json")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(APP_DIR)
+DEMO_FILE = os.path.join(APP_DIR, "demo_tournament.json")
+
+
+def _results_dir():
+    """Куда сохранять таблицы. Скачанная программа на macOS запускается из папки только для чтения,
+    поэтому значок передаёт CS_ELO_RESULTS (~/Documents/CS Elo); иначе — results/ рядом с кодом."""
+    env = os.environ.get("CS_ELO_RESULTS")
+    if env:
+        return env
+    local = os.path.join(ROOT, "results")
+    if os.access(ROOT, os.W_OK):
+        return local
+    return os.path.join(os.path.expanduser("~"), "Documents", "CS Elo")
+
+
+RESULTS_DIR = _results_dir()
 PORT = 8765
 LP_UA = "cs-turnir-elo/0.1 (personal tournament Elo checker)"
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -524,7 +539,7 @@ def result_html(res):
             '<div class="grid" style="margin-top:12px">%s</div>'
             '<h3>Коротко (можно скопировать)</h3><pre>%s</pre>' % (
                 e(res["title"]), res["found"], res["total"], unsure, e(res["date"]),
-                e(os.path.relpath(res["csv"], ROOT)), "".join(cards), e(text_table(res))))
+                e(res["csv"].replace(os.path.expanduser("~"), "~", 1)), "".join(cards), e(text_table(res))))
 
 
 def start_job(url):
@@ -547,7 +562,9 @@ def start_job(url):
     threading.Thread(target=work, daemon=True).start()
 
 
-QUIT = '<p style="margin-top:28px"><a class="btn ghost" href="/quit">Выключить приложение</a></p>'
+QUIT = ('<p style="margin-top:28px;display:flex;gap:8px;flex-wrap:wrap">'
+        '<a class="btn ghost" href="/results">Открыть папку с таблицами</a>'
+        '<a class="btn ghost" href="/quit">Выключить приложение</a></p>')
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -570,6 +587,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send(page("<h1>Приложение выключено</h1><p class=mut>Вкладку можно закрыть.</p>"))
             threading.Thread(target=self.server.shutdown, daemon=True).start()
             return
+        if self.path.startswith("/results"):
+            os.makedirs(RESULTS_DIR, exist_ok=True)
+            opener = "open" if sys.platform == "darwin" else ("explorer" if os.name == "nt" else "xdg-open")
+            subprocess.Popen([opener, RESULTS_DIR])
+            return self.redirect("/job" if JOB["state"] != "idle" else "/")
         if self.path.startswith("/job"):
             st = JOB["state"]
             if st == "running":

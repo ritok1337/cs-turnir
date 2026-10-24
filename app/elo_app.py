@@ -176,13 +176,17 @@ def parse_participants(h):
     return teams
 
 
-def lp_faceit_refs(pages, log):
-    """Из исходного текста страниц игроков берём |faceitdb=<id> и |faceit=<ник>, по 50 за запрос."""
-    refs = {}
-    pages = [p for p in dict.fromkeys(pages) if p]
-    for i in range(0, len(pages), 50):
-        batch = pages[i:i + 50]
-        log("Liquipedia: страницы игроков %d–%d из %d" % (i + 1, i + len(batch), len(pages)))
+_lp_cache = {}
+
+
+def lp_contents(pages, log=None, what="страницы игроков"):
+    """Исходный текст страниц Liquipedia по 50 за запрос: {запрошенное имя: (итоговое имя, текст)}."""
+    out = {}
+    todo = [p for p in dict.fromkeys(pages) if p and p not in _lp_cache]
+    for i in range(0, len(todo), 50):
+        batch = todo[i:i + 50]
+        if log:
+            log("Liquipedia: %s %d–%d из %d" % (what, i + 1, i + len(batch), len(todo)))
         d = lp_api({"action": "query", "prop": "revisions", "rvprop": "content", "rvslots": "main",
                     "format": "json", "formatversion": "2", "redirects": "1",
                     "titles": "|".join(batch)})
@@ -199,11 +203,21 @@ def lp_faceit_refs(pages, log):
             final = t
             for _ in range(3):
                 final = alias.get(final, final)
-            txt = content.get(final, "")
-            u = re.search(r"\|\s*faceitdb\s*=\s*([0-9a-f-]{36})", txt, re.I)
-            n = re.search(r"\|\s*faceit\s*=\s*([^\s|}]+)", txt, re.I)
-            nick = n.group(1).rstrip("/").split("/")[-1] if n else None
-            refs[t] = {"uuid": u.group(1) if u else None, "nick": nick}
+            _lp_cache[t] = (final if final in content else None, content.get(final, ""))
+    for p in pages:
+        if p:
+            out[p] = _lp_cache[p]
+    return out
+
+
+def lp_faceit_refs(pages, log):
+    """Из исходного текста страниц игроков берём |faceitdb=<id> и |faceit=<ник>."""
+    refs = {}
+    for t, (_, txt) in lp_contents(pages, log).items():
+        u = re.search(r"\|\s*faceitdb\s*=\s*([0-9a-f-]{36})", txt, re.I)
+        n = re.search(r"\|\s*faceit\s*=\s*([^\s|}]+)", txt, re.I)
+        nick = n.group(1).rstrip("/").split("/")[-1] if n else None
+        refs[t] = {"uuid": u.group(1) if u else None, "nick": nick}
     return refs
 
 
@@ -275,6 +289,21 @@ def resolve_missing(team, log):
     if not missing:
         return
     known = [p for p in team["players"] if p.get("faceit_id") and counted(p)]
+
+    # Уже найденные, но не подтверждённые аккаунты: подтверждаем, если они дружат с тиммейтами.
+    # Если подтверждённых тиммейтов нет совсем — засчитываем тех, кто дружит друг с другом.
+    pending = [p for p in missing if p.get("faceit_id")]
+    as_user = lambda p: {"id": p["faceit_id"], "friends": p.get("friends") or set()}
+    for p in pending:
+        others = known if known else [q for q in pending if q is not p]
+        if _linked(as_user(p), others):
+            p["verified"] = True
+            how = re.sub(r",\s*(связь с командой не подтверждена|команда не совпала)", "", p.get("how") or "")
+            p["how"] = how + ", связан с тиммейтами"
+    known = [p for p in team["players"] if p.get("faceit_id") and counted(p)]
+    missing = [p for p in team["players"] if not counted(p)]
+    if not missing:
+        return
     used = {p["faceit_id"] for p in known}
     log("FACEIT: ищу без Liquipedia в «%s»: %s" % (team["name"], ", ".join(p["name"] for p in missing)))
 
@@ -356,6 +385,87 @@ def hltv_to_liquipedia(url, log):
 
 
 # ---------------------------------------------------------------- основной сценарий
+PASTE_HINT = ("Можно вставить в поле список команд текстом — например, скопировать блок "
+              "«Teams attending» со страницы турнира на HLTV. По строке на команду: "
+              "«Команда: игрок1, игрок2, игрок3, игрок4, игрок5».")
+
+
+def parse_roster_text(text):
+    """Список команд текстом. Понимает «Команда: a, b, c» (также «-» и «—»)
+    и блоки «Команда» + по игроку на строке."""
+    teams, cur = [], None
+    for raw in text.splitlines():
+        line = re.sub(r"^\s*(\d+[.)]|[-*•])\s*", "", raw).strip().strip("*").strip()
+        if not line:
+            continue
+        m = re.match(r"(.+?)\s*(?::|\s[-—–]\s)\s*(.+)$", line)
+        if m and ("," in m.group(2) or ";" in m.group(2)):
+            name = m.group(1).strip(" *")
+            nicks = [x.strip(" *") for x in re.split(r"[,;]", m.group(2))]
+            cur = {"name": name, "players": []}
+            teams.append(cur)
+        elif cur is None or len(cur["players"]) >= 5 and not m:
+            cur = {"name": line.rstrip(":"), "players": []}
+            teams.append(cur)
+            continue
+        else:
+            nicks = [line]
+        for n in nicks:
+            n = re.sub(r"^(and|plus)\s+", "", n, flags=re.I).strip()
+            if n and not re.search(r"\b(tba|tbd)\b|one\s+tba|^plus one", n, re.I):
+                page = None if re.search(r"[#<>\[\]|{}]", n) else n  # такие символы ломают запрос к Liquipedia
+                cur["players"].append({"name": n, "page": page})
+    return [t for t in teams if t["players"]]
+
+
+def _mentions_team(txt, keys):
+    """Упоминается ли команда на странице игрока: |team=…, {{TH|…|Команда}} — с нечётким сравнением
+    («BC.Game» = «BC.Game Esports»)."""
+    for k in keys:
+        if k and re.search(r"[|=]\s*%s\s*(?:[|}\n]|$)" % re.escape(k), txt, re.I):
+            return True
+    names = re.findall(r"\|\s*team\d?\s*=\s*([^\n|}]+)", txt) + re.findall(r"\{\{TH\|[^|}]*\|([^|}]+)", txt)
+    for n in names:
+        a = norm_nick(n)
+        for k in keys:
+            b = norm_nick(k)
+            if len(a) >= 3 and len(b) >= 3 and (a in b or b in a):
+                return True
+    return False
+
+
+def fix_text_pages(teams, log):
+    """Текстовый режим: страница Liquipedia, найденная по нику, может быть чужой (однофамилец).
+    Оставляем её, только если на ней есть команда игрока; иначе пробуем «Ник (уточнение)»,
+    а если не нашли — игрок ищется через FACEIT с проверкой по тиммейтам."""
+    names = [t["name"] for t in teams]
+    canon = {n: final for n, (final, _) in lp_contents(names, log, "страницы команд").items()}
+    pages = [p["page"] for t in teams for p in t["players"] if p["page"]]
+    contents = lp_contents(pages, log)
+    for t in teams:
+        keys = {t["name"], canon.get(t["name"]) or ""}
+        for p in t["players"]:
+            if not p["page"]:
+                continue
+            final, txt = contents.get(p["page"], (None, ""))
+            if not final or _mentions_team(txt, keys):
+                continue
+            d = lp_api({"action": "query", "list": "prefixsearch", "pssearch": final + " (",
+                        "pslimit": "10", "format": "json", "formatversion": "2"})
+            alts = [x["title"] for x in d.get("query", {}).get("prefixsearch", [])]
+            found = None
+            for a, (afinal, atxt) in lp_contents(alts).items():
+                if afinal and _mentions_team(atxt, keys):
+                    found = a
+                    break
+            if found:
+                log("Liquipedia: «%s» — нашёл страницу «%s»" % (p["name"], found))
+                p["page"] = found
+            else:
+                log("Liquipedia: «%s» — команда на странице не совпала, проверю через FACEIT" % p["name"])
+                p["lp_unsure"] = True
+
+
 def run_tournament(url, log=print):
     url = url.strip()
     if url.lower() == "demo":
@@ -364,6 +474,14 @@ def run_tournament(url, log=print):
             demo = json.load(f)
         return finish(demo["title"], "demo", demo["teams"])
 
+    if not url.lower().startswith("http"):
+        teams = parse_roster_text(url)
+        if not teams:
+            raise FetchError("Не понял текст. " + PASTE_HINT)
+        log("Список из текста: %d команд" % len(teams))
+        fix_text_pages(teams, log)
+        return lookup_teams(teams, "Список команд (вставлен текстом)", "text", log)
+
     host = urllib.parse.urlparse(url).netloc.lower()
     if "hltv.org" in host:
         page = hltv_to_liquipedia(url, log)
@@ -371,7 +489,8 @@ def run_tournament(url, log=print):
     elif "liquipedia.net" in host:
         page = liquipedia_page(url)
     else:
-        raise FetchError("Нужна ссылка на турнир с liquipedia.net или hltv.org (или слово demo).")
+        raise FetchError("Нужна ссылка на турнир с liquipedia.net или hltv.org, список команд текстом "
+                         "или слово demo.")
 
     log("Liquipedia: загружаю страницу турнира")
     d = lp_api({"action": "parse", "page": page, "prop": "text", "format": "json", "redirects": "1"})
@@ -379,8 +498,14 @@ def run_tournament(url, log=print):
         raise FetchError("Liquipedia: страница не найдена (%s)" % page)
     teams = parse_participants(d["parse"]["text"]["*"])
     if not teams:
-        raise FetchError("На странице нет блока участников с составами. "
-                         "Возможно, составы на подстранице этапа — дайте ссылку на неё.")
+        where = " (нашёл по ссылке HLTV: «%s»)" % d["parse"]["title"] if "hltv.org" in host else ""
+        raise FetchError("На Liquipedia%s составы участников ещё не заполнены — так бывает до начала "
+                         "турнира или если они на подстранице этапа. HLTV не пускает программы, "
+                         "поэтому прочитать составы оттуда напрямую не получится. %s" % (where, PASTE_HINT))
+    return lookup_teams(teams, d["parse"]["title"], url, log)
+
+
+def lookup_teams(teams, title, source, log):
     total = sum(len(t["players"]) for t in teams)
     log("Найдено команд: %d, игроков: %d" % (len(teams), total))
 
@@ -394,6 +519,9 @@ def run_tournament(url, log=print):
             r = faceit_lookup(ref) if p["page"] else None
             if r:
                 p.update(r)
+                if p.get("lp_unsure"):  # страница по нику, но с другой командой — нужна проверка
+                    p["verified"] = False
+                    p["how"] = "страница Liquipedia по нику, команда не совпала"
             else:
                 p["elo"] = None
                 if not p["page"]:
@@ -413,7 +541,7 @@ def run_tournament(url, log=print):
         for p in t["players"]:
             if not isinstance(p.get("elo"), int) and p.get("why"):
                 p["why"] += "; на FACEIT по нику и через тиммейтов не найден"
-    return finish(d["parse"]["title"], url, teams)
+    return finish(title, source, teams)
 
 
 def counted(p):
@@ -483,7 +611,7 @@ CSS = """
 @media (prefers-color-scheme:dark){:root{--bg:#121417;--card:#1b1e23;--fg:#e8eaed;--mut:#99a;--line:#2c3138;--lo:#3a1d1d}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 -apple-system,system-ui,sans-serif}
 main{max-width:980px;margin:0 auto;padding:24px 16px}h1{font-size:22px;margin:0 0 4px}.mut{color:var(--mut)}
-form{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}input[type=text]{flex:1;min-width:240px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font-size:15px}
+form{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0;align-items:flex-start}textarea{flex:1;min-width:240px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:15px/1.4 -apple-system,system-ui,sans-serif;resize:vertical}
 button,.btn{padding:10px 16px;border:0;border-radius:8px;background:var(--acc);color:#fff;font-weight:600;cursor:pointer;text-decoration:none;font-size:15px}
 .ghost{background:transparent;color:var(--mut);border:1px solid var(--line)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:12px}
@@ -505,9 +633,10 @@ def page(body, refresh=False):
 
 def form_html(value=""):
     return ('<h1>FACEIT Elo участников турнира CS2</h1>'
-            '<div class="mut">Вставьте ссылку на турнир с Liquipedia или HLTV. Для проверки без интернета — слово <b>demo</b>.</div>'
-            '<form method="post" action="/run"><input type="text" name="url" '
-            'placeholder="https://liquipedia.net/counterstrike/..." value="%s" autofocus>'
+            '<div class="mut">Вставьте ссылку на турнир с Liquipedia или HLTV — или список команд текстом, '
+            'по строке на команду: <b>Команда: игрок1, игрок2, …</b> Для проверки без интернета — слово <b>demo</b>.</div>'
+            '<form method="post" action="/run"><textarea name="url" rows="3" autofocus '
+            'placeholder="https://liquipedia.net/counterstrike/...&#10;или&#10;Natus Vincere: Aleksib, iM, b1t, w0nderful, makazze">%s</textarea>'
             '<button>Проверить</button></form>' % html.escape(value))
 
 

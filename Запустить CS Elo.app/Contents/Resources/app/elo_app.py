@@ -53,12 +53,14 @@ class FetchError(Exception):
 
 
 # ---------------------------------------------------------------- HTTP
-def _urllib_get(url, ua, timeout):
+def _urllib_get(url, ua, timeout, headers=None):
     """Запасной путь без curl (старые Windows)."""
     import gzip
     import urllib.error
     import urllib.request
-    req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept-Encoding": "gzip"})
+    h = {"User-Agent": ua, "Accept-Encoding": "gzip"}
+    h.update(headers or {})
+    req = urllib.request.Request(url, headers=h)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             code, data, enc = r.status, r.read(), r.headers.get("Content-Encoding")
@@ -74,16 +76,22 @@ def _urllib_get(url, ua, timeout):
 _NO_CURL = []
 
 
-def http_get(url, ua, timeout=25):
+def http_get(url, ua, timeout=25, headers=None):
     if _NO_CURL:
-        return _urllib_get(url, ua, timeout)
+        return _urllib_get(url, ua, timeout, headers)
     kw = {"creationflags": 0x08000000} if os.name == "nt" else {}  # без мигающих окон на Windows
+    cmd = ["curl", "-s", "-L", "--compressed", "--max-time", str(timeout), "-A", ua]
+    stdin = None
+    if headers:
+        # заголовки (в т.ч. ключ FACEIT) передаём через stdin, чтобы ключ не был виден в списке процессов
+        cmd += ["-H", "@-"]
+        stdin = "".join("%s: %s\n" % kv for kv in headers.items()).encode("utf-8")
+    cmd += ["-w", "\n%{http_code}", url]
     try:
-        r = subprocess.run(["curl", "-s", "-L", "--compressed", "--max-time", str(timeout),
-                            "-A", ua, "-w", "\n%{http_code}", url], capture_output=True, **kw)
+        r = subprocess.run(cmd, input=stdin, capture_output=True, **kw)
     except FileNotFoundError:
         _NO_CURL.append(1)
-        return _urllib_get(url, ua, timeout)
+        return _urllib_get(url, ua, timeout, headers)
     out = r.stdout.decode("utf-8", "replace")
     body, _, code = out.rpartition("\n")
     try:
@@ -133,6 +141,125 @@ def faceit_get(path):
                 pass
         time.sleep(20 * (attempt + 1))  # 429 / защита — ждём и пробуем ещё
     return None
+
+
+# ---------------------------------------------------------------- официальный API FACEIT (по ключу)
+KEY_FILE = os.path.join(os.path.expanduser("~"), "Documents", "CS Elo", "faceit_key.txt")
+
+
+def faceit_key():
+    """Ключ разработчика FACEIT: переменная FACEIT_API_KEY или файл Документы/CS Elo/faceit_key.txt.
+    Ключ хранится только на этом компьютере и не попадает в код на GitHub."""
+    k = os.environ.get("FACEIT_API_KEY", "").strip()
+    if not k:
+        try:
+            with open(KEY_FILE, encoding="utf-8") as f:
+                k = f.read().strip()
+        except OSError:
+            k = ""
+    return k if re.fullmatch(r"[0-9a-fA-F-]{36}", k) else ""
+
+
+def save_faceit_key(k):
+    k = k.strip()
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", k):
+        return "Ключ должен выглядеть как xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 символов)."
+    code = 0
+    for _ in range(3):
+        code, _ = http_get("https://open.faceit.com/data/v4/players?nickname=s1mple&game=cs2",
+                           BROWSER_UA, 15, {"Authorization": "Bearer " + k})
+        if code:
+            break
+    # Сохраняем, только если FACEIT явно принял ключ (200 — игрок есть, 404 — нет, но ключ узнан)
+    if code in (400, 401, 403):
+        return "FACEIT не принял ключ. Нужен серверный ключ (Server side) из developers.faceit.com."
+    if code not in (200, 404):
+        return "Не удалось проверить ключ (нет связи с FACEIT, код %s). Попробуйте ещё раз." % code
+    os.makedirs(os.path.dirname(KEY_FILE), exist_ok=True)
+    with open(KEY_FILE, "w", encoding="utf-8") as f:
+        f.write(k)
+    try:
+        os.chmod(KEY_FILE, 0o600)
+    except OSError:
+        pass
+    return ""
+
+
+_last_data = [0.0]
+
+
+def faceit_data(path, params=None):
+    """GET к open.faceit.com/data/v4 (только если есть ключ). Возвращает JSON или None."""
+    k = faceit_key()
+    if not k:
+        return None
+    url = "https://open.faceit.com/data/v4" + path + ("?" + urllib.parse.urlencode(params) if params else "")
+    for attempt in range(3):
+        wait = 0.15 - (time.time() - _last_data[0])
+        if wait > 0:
+            time.sleep(wait)
+        code, body = http_get(url, BROWSER_UA, 20, {"Authorization": "Bearer " + k, "Accept": "application/json"})
+        _last_data[0] = time.time()
+        if code == 200:
+            try:
+                return json.loads(body)
+            except ValueError:
+                return None
+        if code in (400, 401, 403, 404):
+            return None
+        time.sleep(5 * (attempt + 1))  # 429 / сбой — ждём и повторяем
+    return None
+
+
+_search_cache = {}
+
+
+def faceit_search_ids(nick, limit=20, keep=5):
+    """Настоящий поиск игроков по нику (как на сайте FACEIT) — только с ключом.
+    Возвращает до keep самых похожих по нику, чтобы не запрашивать лишние профили."""
+    if nick not in _search_cache:
+        d = faceit_data("/search/players", {"nickname": nick, "game": "cs2", "limit": str(limit)})
+        items = [(nick_similar(nick, x.get("nickname")), x["player_id"])
+                 for x in (d or {}).get("items", []) if x.get("player_id")]
+        items = sorted((it for it in items if it[0] >= 0.6), key=lambda it: -it[0])
+        _search_cache[nick] = [pid for _, pid in items[:keep]]
+    return _search_cache[nick]
+
+
+def pick_core_five(members, log, days=120):
+    """По истории матчей выбираем 5 игроков, которые чаще всех играли вместе (за последние days дней).
+    Возвращает множество faceit_id или None, если данных нет."""
+    ids = {m["faceit_id"] for m in members if m.get("faceit_id")}
+    since = time.time() - days * 86400
+    together = {}  # match_id -> множество игроков состава в одной команде этого матча
+    for m in members:
+        d = faceit_data("/players/%s/history" % m["faceit_id"], {"game": "cs2", "limit": "50"})
+        for it in (d or {}).get("items", []):
+            if (it.get("started_at") or 0) < since:
+                continue
+            for side in (it.get("teams") or {}).values():
+                pl = {p.get("player_id") for p in side.get("players") or []} & ids
+                if m["faceit_id"] in pl and len(pl) >= 2:
+                    together[it.get("match_id")] = pl
+    w = {}
+    for pl in together.values():
+        pl = sorted(pl)
+        for i, a in enumerate(pl):
+            for b in pl[i + 1:]:
+                w[(a, b)] = w.get((a, b), 0) + 1
+    if not w:
+        return None, 0
+    weight = lambda a, b: w.get((min(a, b), max(a, b)), 0)
+    a, b = max(w, key=w.get)
+    core = [a, b]
+    while len(core) < 5:
+        rest = [x for x in ids if x not in core]
+        best = max(rest, key=lambda x: sum(weight(x, c) for c in core), default=None)
+        if best is None or sum(weight(best, c) for c in core) == 0:
+            break
+        core.append(best)
+    log("FACEIT: основной состав по %d совместным матчам: %d игроков" % (len(together), len(core)))
+    return set(core), len(together)
 
 
 # ---------------------------------------------------------------- Liquipedia
@@ -328,7 +455,7 @@ def _linked(p, known):
 
 def resolve_missing(team, log):
     """Ищем на FACEIT игроков без профиля. Засчитываем только тех, кто связан с командой."""
-    missing = [p for p in team["players"] if not counted(p)]
+    missing = [p for p in team["players"] if not counted(p) and not p.get("bench")]
     if not missing:
         return
     known = [p for p in team["players"] if p.get("faceit_id") and counted(p)]
@@ -344,7 +471,7 @@ def resolve_missing(team, log):
             how = re.sub(r",\s*(связь с командой не подтверждена|команда не совпала)", "", p.get("how") or "")
             p["how"] = how + ", связан с тиммейтами"
     known = [p for p in team["players"] if p.get("faceit_id") and counted(p)]
-    missing = [p for p in team["players"] if not counted(p)]
+    missing = [p for p in team["players"] if not counted(p) and not p.get("bench")]
     if not missing:
         return
     used = {p["faceit_id"] for p in known}
@@ -380,7 +507,16 @@ def resolve_missing(team, log):
                 best, best_score, how = exact, 2.0, "по нику, связан с тиммейтами"
             else:
                 best, best_score, how = exact, 0.5, "по нику, связь с командой не подтверждена"
-        # 2) Похожий ник среди друзей тиммейтов и FACEIT-команды
+        # 2) Настоящий поиск по нику (с ключом FACEIT): засчитываем, только если связан с тиммейтами
+        if best_score < 2.0 and known and faceit_key():
+            for sid in faceit_search_ids(p["name"]):
+                if sid in used:
+                    continue
+                c = faceit_user(uuid=sid)
+                if c and nick_similar(p["name"], c.get("nickname")) >= 0.6 and _linked(c, known):
+                    best, best_score, how = c, 2.0, "поиск FACEIT по нику, связан с тиммейтами"
+                    break
+        # 3) Похожий ник среди друзей тиммейтов и FACEIT-команды
         if best_score < 2.0:
             for fid in pool:
                 c = faceit_user(uuid=fid)
@@ -458,8 +594,21 @@ def faceit_team_fill(team, log):
         info = _info(u, "состав FACEIT-команды «%s»" % chosen.get("name"))
         info.update(name=u.get("nickname") or mid, page=None, verified=True)
         team["players"].append(info)
-    team["players"].sort(key=lambda p: -(p.get("elo") or 0))
     log("FACEIT: «%s» → команда «%s», игроков: %d" % (team["name"], chosen.get("name"), len(team["players"])))
+    if len(team["players"]) > 5:
+        if not faceit_key():
+            team["faceit_team"]["core"] = "nokey"
+        else:
+            core, n = pick_core_five(team["players"], log)
+            if core and len(core) >= 4:
+                for p in team["players"]:
+                    if p["faceit_id"] not in core:
+                        p["bench"] = True
+                        p["how"] = "запасной: в последних матчах с основным составом не играл"
+                team["faceit_team"]["core"] = n
+            else:
+                team["faceit_team"]["core"] = "nodata"
+    team["players"].sort(key=lambda p: (bool(p.get("bench")), -(p.get("elo") or 0)))
 
 
 def hltv_to_liquipedia(url, log):
@@ -651,8 +800,8 @@ def lookup_teams(teams, title, source, log):
 
 
 def counted(p):
-    """Идёт в среднее: эло есть и аккаунт подтверждён (Liquipedia или связь с тиммейтами)."""
-    return isinstance(p.get("elo"), int) and p.get("verified", True)
+    """Идёт в среднее: эло есть, аккаунт подтверждён (Liquipedia или связь с тиммейтами) и это не запасной."""
+    return isinstance(p.get("elo"), int) and p.get("verified", True) and not p.get("bench")
 
 
 def finish(title, source, teams):
@@ -666,8 +815,9 @@ def finish(title, source, teams):
            "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
            "found": sum(1 for t in teams for p in t["players"] if counted(p)),
            "unsure": sum(1 for t in teams for p in t["players"]
-                         if isinstance(p.get("elo"), int) and not counted(p)),
-           "total": sum(len(t["players"]) for t in teams)}
+                         if isinstance(p.get("elo"), int) and not counted(p) and not p.get("bench")),
+           "bench": sum(1 for t in teams for p in t["players"] if p.get("bench")),
+           "total": sum(1 for t in teams for p in t["players"] if not p.get("bench"))}
     res["csv"] = save_csv(res)
     return res
 
@@ -708,8 +858,11 @@ def text_table(res):
         if not t["players"]:
             lines.append("%s - %s" % (t["name"], t.get("note") or "игроки не найдены"))
             continue
-        elos = " ".join(elo_text(p) for p in t["players"])
+        elos = " ".join(elo_text(p) for p in t["players"] if not p.get("bench"))
         extra = "  [состав FACEIT-команды «%s»]" % t["faceit_team"]["name"] if t.get("faceit_team") else ""
+        bench = [str(p["elo"]) for p in t["players"] if p.get("bench") and isinstance(p.get("elo"), int)]
+        if bench:
+            extra += "  [запасные, не в среднем: %s]" % " ".join(bench)
         lines.append("%s - %s (%s)%s" % (t["name"], elos, t["avg"] if t["avg"] else "?", extra))
     return "\n".join(lines)
 
@@ -750,7 +903,24 @@ def form_html(value=""):
             'состав найдётся на FACEIT. Для проверки без интернета — слово <b>demo</b>.</div>'
             '<form method="post" action="/run"><textarea name="url" rows="3" autofocus '
             'placeholder="https://liquipedia.net/counterstrike/...&#10;или&#10;Natus Vincere: Aleksib, iM, b1t, w0nderful, makazze">%s</textarea>'
-            '<button>Проверить</button></form>' % html.escape(value))
+            '<button>Проверить</button></form>' % html.escape(value)) + key_html()
+
+
+def key_html(msg=""):
+    if faceit_key() and not msg:
+        return ('<details class="mut" style="margin:-6px 0 12px"><summary>Ключ FACEIT подключён ✓</summary>'
+                '<p>Используется настоящий поиск по нику и выбор основной пятёрки по совместным матчам. '
+                'Ключ хранится только на этом компьютере: %s</p>%s</details>' % (html.escape(KEY_FILE), _key_form()))
+    return ('<details class="mut" style="margin:-6px 0 12px"%s><summary>Ключ FACEIT (необязательно, но находит больше игроков)</summary>'
+            '%s<p>С бесплатным ключом разработчика приложение ищет игроков по нику как сам сайт FACEIT и для команд '
+            'по названию считает только основную пятёрку. Ключ: developers.faceit.com → своё приложение → '
+            'API Keys → тип <b>Server side</b>. Хранится только на этом компьютере.</p>%s</details>' % (
+                " open" if msg else "", ('<div class="card err">%s</div>' % html.escape(msg)) if msg else "", _key_form()))
+
+
+def _key_form():
+    return ('<form method="post" action="/key" style="margin:6px 0"><textarea name="key" rows="1" '
+            'placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"></textarea><button>Сохранить ключ</button></form>')
 
 
 def result_html(res):
@@ -766,11 +936,12 @@ def result_html(res):
                 lvl = '<span class="lvl">%s</span>' % p["level"] if p.get("level") else ""
                 tag = ""
                 if p.get("how") and p["how"] != "liquipedia":
-                    tag = '<div class="tag%s">%s</div>' % ("" if counted(p) else " warn", e(
+                    warn = not counted(p) and not p.get("bench")
+                    tag = '<div class="tag%s">%s</div>' % (" warn" if warn else "", e(
                         p["how"] + ("" if counted(p) else " — в среднее не входит")))
-                elo = ("%d" if counted(p) else "~%d") % p["elo"]
-                cells.append('<tr><td><a href="%s" target="_blank">%s</a>%s%s</td><td class=n>%s%s</td></tr>' % (
-                    e(link), e(p["name"]), alt, tag, elo, lvl))
+                elo = ("%d" if counted(p) or p.get("bench") else "~%d") % p["elo"]
+                cells.append('<tr%s><td><a href="%s" target="_blank">%s</a>%s%s</td><td class=n>%s%s</td></tr>' % (
+                    ' class="miss"' if p.get("bench") else "", e(link), e(p["name"]), alt, tag, elo, lvl))
             else:
                 why = (' <span class="mut" title="%s">ⓘ</span>' % e(p["why"])) if p.get("why") else ""
                 cells.append('<tr class="miss"><td>%s</td><td class=n>не найден%s</td></tr>' % (e(p["name"]), why))
@@ -778,7 +949,16 @@ def result_html(res):
         ft = t.get("faceit_team")
         if ft:
             tlink = lambda x: '<a href="https://www.faceit.com/ru/teams/%s" target="_blank">%s</a>' % (e(x["id"]), e(x["name"]))
-            src = "состав с FACEIT: " + tlink(ft) + " (может включать запасных)"
+            core = ft.get("core")
+            if isinstance(core, int):
+                note = "основная пятёрка — по %d совместным матчам за 4 месяца, остальные — запасные" % core
+            elif core == "nokey":
+                note = "в среднем весь состав, включая запасных — подключите ключ FACEIT внизу страницы, чтобы считать основную пятёрку"
+            elif core == "nodata":
+                note = "совместных матчей не нашлось — в среднем весь состав"
+            else:
+                note = ""
+            src = "состав с FACEIT: " + tlink(ft) + ("; " + note if note else "")
             if ft["alts"]:
                 src += "; ещё с таким названием: " + ", ".join(
                     "%s (%d)" % (tlink(a), a["n"]) for a in ft["alts"])
@@ -789,6 +969,8 @@ def result_html(res):
         cards.append('<div class="card"><table><tr><th>%s</th><th class=n>%s</th></tr>%s%s</table></div>' % (
             e(t["name"]), ("сред. %s" % t["avg"]) if t["avg"] else "—", src, "".join(cells)))
     unsure = (" · ещё %d найдено только по нику (~, в среднее не входят)" % res["unsure"]) if res.get("unsure") else ""
+    if res.get("bench"):
+        unsure += " · запасных в составах FACEIT-команд: %d (в среднее не входят)" % res["bench"]
     return ('<h2>%s</h2><div class="mut">Эло найдено у %d из %d игроков%s · %s · таблица сохранена: %s</div>'
             '<div class="grid" style="margin-top:12px">%s</div>'
             '<h3>Коротко (можно скопировать)</h3><pre>%s</pre>' % (
@@ -862,6 +1044,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
         data = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8"))
+        if self.path.startswith("/key"):
+            err = save_faceit_key((data.get("key") or [""])[0])
+            if err:
+                return self.send(page(form_html().replace(key_html(), "") + key_html(err) + QUIT))
+            return self.redirect("/")
         url = (data.get("url") or [""])[0].strip()
         if url:
             start_job(url)

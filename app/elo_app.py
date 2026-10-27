@@ -20,17 +20,21 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+FROZEN = getattr(sys, "frozen", False)  # собрано в .exe (PyInstaller) для Windows
+APP_DIR = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(APP_DIR)
 DEMO_FILE = os.path.join(APP_DIR, "demo_tournament.json")
 
 
 def _results_dir():
     """Куда сохранять таблицы. Скачанная программа на macOS запускается из папки только для чтения,
-    поэтому значок передаёт CS_ELO_RESULTS (~/Documents/CS Elo); иначе — results/ рядом с кодом."""
+    поэтому значок передаёт CS_ELO_RESULTS (~/Documents/CS Elo); .exe тоже пишет в Документы;
+    иначе — results/ рядом с кодом."""
     env = os.environ.get("CS_ELO_RESULTS")
     if env:
         return env
+    if FROZEN:
+        return os.path.join(os.path.expanduser("~"), "Documents", "CS Elo")
     local = os.path.join(ROOT, "results")
     if os.access(ROOT, os.W_OK):
         return local
@@ -49,9 +53,37 @@ class FetchError(Exception):
 
 
 # ---------------------------------------------------------------- HTTP
+def _urllib_get(url, ua, timeout):
+    """Запасной путь без curl (старые Windows)."""
+    import gzip
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept-Encoding": "gzip"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            code, data, enc = r.status, r.read(), r.headers.get("Content-Encoding")
+    except urllib.error.HTTPError as e:
+        code, data, enc = e.code, e.read(), e.headers.get("Content-Encoding")
+    except Exception:  # noqa — сеть недоступна, таймаут
+        return 0, ""
+    if enc == "gzip":
+        data = gzip.decompress(data)
+    return code, data.decode("utf-8", "replace")
+
+
+_NO_CURL = []
+
+
 def http_get(url, ua, timeout=25):
-    r = subprocess.run(["curl", "-s", "-L", "--compressed", "--max-time", str(timeout),
-                        "-A", ua, "-w", "\n%{http_code}", url], capture_output=True)
+    if _NO_CURL:
+        return _urllib_get(url, ua, timeout)
+    kw = {"creationflags": 0x08000000} if os.name == "nt" else {}  # без мигающих окон на Windows
+    try:
+        r = subprocess.run(["curl", "-s", "-L", "--compressed", "--max-time", str(timeout),
+                            "-A", ua, "-w", "\n%{http_code}", url], capture_output=True, **kw)
+    except FileNotFoundError:
+        _NO_CURL.append(1)
+        return _urllib_get(url, ua, timeout)
     out = r.stdout.decode("utf-8", "replace")
     body, _, code = out.rpartition("\n")
     try:
@@ -743,15 +775,45 @@ class Handler(BaseHTTPRequestHandler):
         self.redirect("/job")
 
 
+class Server(ThreadingHTTPServer):
+    # На Windows SO_REUSEADDR позволяет второму экземпляру занять тот же порт — запрещаем
+    allow_reuse_address = os.name != "nt"
+    daemon_threads = True
+
+
 def serve(open_browser=True):
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print("Открыто: http://localhost:%d" % PORT)
+    url = "http://localhost:%d" % PORT
+    try:
+        srv = Server(("127.0.0.1", PORT), Handler)
+    except OSError:
+        # Уже запущено (второй двойной щелчок) — просто открываем страницу
+        print("CS Elo уже работает: " + url)
+        if open_browser:
+            webbrowser.open(url)
+        return
+    print("CS Elo работает: %s" % url)
+    print("Страница откроется в браузере. Чтобы выключить приложение — закройте это окно")
+    print("или нажмите «Выключить приложение» на странице.")
+    print("Таблицы сохраняются в: %s" % RESULTS_DIR)
     if open_browser:
-        webbrowser.open("http://localhost:%d" % PORT)
-    srv.serve_forever()
+        webbrowser.open(url)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def _utf8_console():
+    """Консоль Windows по умолчанию не в UTF-8 — без этого русский текст может уронить программу."""
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
 
 if __name__ == "__main__":
+    _utf8_console()
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if args:
         try:

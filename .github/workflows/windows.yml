@@ -1,0 +1,93 @@
+# Сборка CS-Elo.exe для Windows: собирается на компьютере GitHub с Windows,
+# проверяется и прикладывается к релизу как cs-turnir-windows-<версия>.zip
+name: Windows build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Релиз, к которому приложить сборку (например v0.4.0). Пусто — только собрать."
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Собрать CS-Elo.exe
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          pyinstaller --onefile --console --name CS-Elo --add-data "app/demo_tournament.json;." app/elo_app.py
+          Get-Item dist/CS-Elo.exe | Format-List Name, Length
+
+      - name: Проверка 1 — тестовые данные (demo)
+        shell: pwsh
+        run: |
+          $out = & dist/CS-Elo.exe demo 2>&1 | Out-String
+          Write-Output $out
+          if ($out -notmatch "Demo Wolves - 4210") { throw "demo: нет ожидаемой таблицы" }
+
+      - name: Проверка 2 — страница, повторный запуск, demo через страницу
+        shell: pwsh
+        run: |
+          $p = Start-Process dist/CS-Elo.exe -ArgumentList "--no-browser" -PassThru -RedirectStandardOutput srv.log -RedirectStandardError srv.err
+          Start-Sleep 6
+          $home_ = Invoke-WebRequest http://localhost:8765/ -UseBasicParsing
+          if ($home_.Content -notmatch "FACEIT Elo") { throw "главная страница не открылась" }
+          $second = & dist/CS-Elo.exe --no-browser 2>&1 | Out-String
+          Write-Output "Второй запуск: $second"
+          if ($second -notmatch "уже работает") { throw "второй запуск не заметил первый" }
+          Invoke-WebRequest http://localhost:8765/run -Method Post -Body "url=demo" -ContentType "application/x-www-form-urlencoded" -UseBasicParsing -MaximumRedirection 0 -ErrorAction SilentlyContinue | Out-Null
+          Start-Sleep 2
+          $job = Invoke-WebRequest http://localhost:8765/job -UseBasicParsing
+          if ($job.Content -notmatch "Demo Hawks") { throw "результат demo не показан на странице" }
+          Invoke-WebRequest http://localhost:8765/quit -UseBasicParsing | Out-Null
+          Start-Sleep 2
+          Get-Content srv.log
+          $csv = Get-ChildItem "$env:USERPROFILE/Documents/CS Elo/*.csv"
+          if (-not $csv) { throw "CSV не сохранился в Документы\CS Elo" }
+          Write-Output "CSV: $($csv.FullName)"
+
+      - name: Проверка 3 — настоящая команда через интернет (Liquipedia + FACEIT)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = & dist/CS-Elo.exe "Natus Vincere: Aleksib, iM, b1t, w0nderful, makazze" 2>&1 | Out-String
+          Write-Output $out
+          if ($out -notmatch "Natus Vincere - \d{4}") { throw "эло не получено (возможно, сайты не пускают сервер GitHub)" }
+
+      - name: Упаковать
+        shell: pwsh
+        run: |
+          $name = if ($env:TAG) { "cs-turnir-windows-$env:TAG.zip" } else { "cs-turnir-windows.zip" }
+          New-Item -ItemType Directory cs-turnir | Out-Null
+          Copy-Item dist/CS-Elo.exe cs-turnir/
+          Copy-Item windows/README-windows.txt cs-turnir/
+          Compress-Archive cs-turnir $name
+          "ZIP=$name" | Out-File -Append $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cs-turnir-windows
+          path: ${{ env.ZIP }}
+
+      - name: Приложить к релизу
+        if: env.TAG != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload $env:TAG $env:ZIP --clobber

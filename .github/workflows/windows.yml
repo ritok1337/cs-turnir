@@ -51,7 +51,7 @@ jobs:
           $second = & dist/CS-Elo.exe --no-browser 2>&1 | Out-String
           Write-Output "Второй запуск: $second"
           if ($second -notmatch "уже работает") { throw "второй запуск не заметил первый" }
-          Invoke-WebRequest http://localhost:8765/run -Method Post -Body "url=demo" -ContentType "application/x-www-form-urlencoded" -UseBasicParsing -MaximumRedirection 0 -ErrorAction SilentlyContinue | Out-Null
+          Invoke-WebRequest http://localhost:8765/run -Method Post -Body "url=demo" -ContentType "application/x-www-form-urlencoded" -UseBasicParsing -MaximumRedirection 0 -SkipHttpErrorCheck | Out-Null
           Start-Sleep 2
           $job = Invoke-WebRequest http://localhost:8765/job -UseBasicParsing
           if ($job.Content -notmatch "Demo Hawks") { throw "результат demo не показан на странице" }

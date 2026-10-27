@@ -162,9 +162,26 @@ def _player_from_link(m):
     return {"name": inner or title, "page": page}
 
 
+def _real_team(name):
+    return bool(name) and not re.fullmatch(r"\?|tb[ad]|to be (announced|decided)", name.strip(), re.I)
+
+
+def _add_team(teams, name, players):
+    """Добавить карточку команды. Пустой состав допустим (найдём на FACEIT по названию);
+    если команда уже есть без состава, а здесь состав есть — берём этот."""
+    if not _real_team(name):
+        return
+    for t in teams:
+        if t["name"] == name:
+            if not t["players"] and players:
+                t["players"] = players
+            return
+    teams.append({"name": name, "players": players})
+
+
 def parse_participants(h):
     h = h.replace("&#95;", "_")
-    teams, seen = [], set()
+    teams = []
     # Новый формат карточек (2024+)
     for card in re.split(r'class="[^"]*\bteam-participant-card"', h)[1:]:
         m = re.search(r'<span class="name"[^>]*>(.*?)</span>', card, re.S)
@@ -182,10 +199,7 @@ def parse_participants(h):
             lm = LINK_RE.search(piece)
             if lm:
                 players.append(_player_from_link(lm))
-        if name in seen or not players:
-            continue
-        seen.add(name)
-        teams.append({"name": name, "players": players})
+        _add_team(teams, name, players)
     if teams:
         return teams
     # Старый формат (teamcard) для турниров прошлых лет
@@ -201,10 +215,7 @@ def parse_participants(h):
             lm = LINK_RE.search(row[th.end():])
             if lm:
                 players.append(_player_from_link(lm))
-        if name in seen or not players:
-            continue
-        seen.add(name)
-        teams.append({"name": name, "players": players})
+        _add_team(teams, name, players)
     return teams
 
 
@@ -388,6 +399,69 @@ def resolve_missing(team, log):
                 known.append(info)
 
 
+# ---------------------------------------------------------------- команда без ников: состав с FACEIT
+def faceit_team_search(name):
+    """Команды CS2 на FACEIT с этим названием (по name или nickname), лучшие первыми."""
+    code, body = http_get("https://www.faceit.com/api/searcher/v1/teams?" + urllib.parse.urlencode(
+        {"query": name, "limit": "20"}), BROWSER_UA, 15)
+    try:
+        found = (json.loads(body).get("payload") or []) if code == 200 else []
+    except ValueError:
+        found = []
+    want = norm_nick(name)
+    out = []
+    for t in found:
+        if t.get("game") != "cs2" or len(t.get("members") or []) < 4:
+            continue  # команды из 1–3 человек — чаще всего случайные «однофамильцы»
+        names = [norm_nick(t.get("name")), norm_nick(t.get("nickname"))]
+        if want in names:
+            score = 2
+        elif any(len(n) >= 3 and (want in n or n in want) for n in names if n):
+            score = 1
+        else:
+            continue
+        out.append((score, len(t.get("members") or []), t))
+    out.sort(key=lambda x: (-x[0], -x[1]))
+    return [t for _, _, t in out]
+
+
+def faceit_team_fill(team, log):
+    """Если ники игроков неизвестны — берём состав команды с таким названием на FACEIT."""
+    log("FACEIT: ищу команду «%s»" % team["name"])
+    cands = faceit_team_search(team["name"])
+    if not cands:
+        team["note"] = "команда с таким названием на FACEIT не найдена"
+        return
+    # Среди точных совпадений берём недавно обновлённую (живой состав), при равенстве — с большим составом
+    detailed = []
+    for t in cands[:4]:
+        code, body = http_get("https://www.faceit.com/api/teams/v3/teams/" + t["id"], BROWSER_UA, 15)
+        try:
+            d = json.loads(body).get("payload") if code == 200 else None
+        except ValueError:
+            d = None
+        if d:
+            exact = norm_nick(team["name"]) in (norm_nick(d.get("name")), norm_nick(d.get("nickname")))
+            detailed.append((exact, d.get("updated_at") or "", d))
+    if not detailed:
+        team["note"] = "FACEIT не отдал состав команды"
+        return
+    detailed.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    chosen = detailed[0][2]
+    team["faceit_team"] = {"name": chosen.get("name"), "id": chosen["id"],
+                           "alts": [{"name": d.get("name"), "id": d["id"], "n": len(d.get("members_ids") or [])}
+                                    for _, _, d in detailed[1:]]}
+    for mid in chosen.get("members_ids") or []:
+        u = faceit_user(uuid=mid)
+        if not u:
+            continue
+        info = _info(u, "состав FACEIT-команды «%s»" % chosen.get("name"))
+        info.update(name=u.get("nickname") or mid, page=None, verified=True)
+        team["players"].append(info)
+    team["players"].sort(key=lambda p: -(p.get("elo") or 0))
+    log("FACEIT: «%s» → команда «%s», игроков: %d" % (team["name"], chosen.get("name"), len(team["players"])))
+
+
 def hltv_to_liquipedia(url, log):
     """HLTV блокирует программы, поэтому ищем этот же турнир на Liquipedia по названию из ссылки."""
     m = re.search(r"/events/\d+/([^/?#]+)", url)
@@ -419,35 +493,30 @@ def hltv_to_liquipedia(url, log):
 # ---------------------------------------------------------------- основной сценарий
 PASTE_HINT = ("Можно вставить в поле список команд текстом — например, скопировать блок "
               "«Teams attending» со страницы турнира на HLTV. По строке на команду: "
-              "«Команда: игрок1, игрок2, игрок3, игрок4, игрок5».")
+              "«Команда: игрок1, игрок2, игрок3, игрок4, игрок5». Если ники неизвестны — "
+              "просто названия команд, по одному на строке: состав найдётся на FACEIT.")
 
 
 def parse_roster_text(text):
-    """Список команд текстом. Понимает «Команда: a, b, c» (также «-» и «—»)
-    и блоки «Команда» + по игроку на строке."""
-    teams, cur = [], None
+    """Список команд текстом, по строке на команду:
+      «Команда: игрок1, игрок2, …» (также через « - » / « — ») — ники известны;
+      «Команда» (просто название) — ников нет, состав ищется на FACEIT по названию команды."""
+    teams = []
     for raw in text.splitlines():
         line = re.sub(r"^\s*(\d+[.)]|[-*•])\s*", "", raw).strip().strip("*").strip()
         if not line:
             continue
-        m = re.match(r"(.+?)\s*(?::|\s[-—–]\s)\s*(.+)$", line)
-        if m and ("," in m.group(2) or ";" in m.group(2)):
-            name = m.group(1).strip(" *")
-            nicks = [x.strip(" *") for x in re.split(r"[,;]", m.group(2))]
-            cur = {"name": name, "players": []}
-            teams.append(cur)
-        elif cur is None or len(cur["players"]) >= 5 and not m:
-            cur = {"name": line.rstrip(":"), "players": []}
-            teams.append(cur)
-            continue
-        else:
-            nicks = [line]
-        for n in nicks:
-            n = re.sub(r"^(and|plus)\s+", "", n, flags=re.I).strip()
+        m = re.match(r"(.+?)\s*(?::|\s[-—–]\s)\s*(.*)$", line)
+        name, rest = (m.group(1), m.group(2)) if m else (line, "")
+        team = {"name": name.strip(" *:"), "players": []}
+        for n in re.split(r"[,;]", rest):
+            n = re.sub(r"^(and|plus)\s+", "", n.strip(" *"), flags=re.I).strip()
             if n and not re.search(r"\b(tba|tbd)\b|one\s+tba|^plus one", n, re.I):
                 page = None if re.search(r"[#<>\[\]|{}]", n) else n  # такие символы ломают запрос к Liquipedia
-                cur["players"].append({"name": n, "page": page})
-    return [t for t in teams if t["players"]]
+                team["players"].append({"name": n, "page": page})
+        if team["name"]:
+            teams.append(team)
+    return teams
 
 
 def _mentions_team(txt, keys):
@@ -538,6 +607,9 @@ def run_tournament(url, log=print):
 
 
 def lookup_teams(teams, title, source, log):
+    for t in teams:
+        if not t["players"]:  # ники неизвестны — состав берём с FACEIT по названию команды
+            faceit_team_fill(t, log)
     total = sum(len(t["players"]) for t in teams)
     log("Найдено команд: %d, игроков: %d" % (len(teams), total))
 
@@ -546,6 +618,8 @@ def lookup_teams(teams, title, source, log):
     for t in teams:
         for p in t["players"]:
             n += 1
+            if p.get("faceit_id"):  # уже взят из состава FACEIT-команды
+                continue
             log("FACEIT: %d из %d — %s" % (n, total, p["name"]))
             ref = refs.get(p["page"]) or {}
             r = faceit_lookup(ref) if p["page"] else None
@@ -607,6 +681,8 @@ def save_csv(res):
         w.writerow(["Команда", "Игрок", "Ник на FACEIT", "Elo", "Уровень", "Как найден",
                     "Учтён в среднем", "Среднее по команде"])
         for t in res["teams"]:
+            if not t["players"]:
+                w.writerow([t["name"], "", "", "не найдена", "", t.get("note") or "", "нет", ""])
             for p in t["players"]:
                 w.writerow([t["name"], p["name"], p.get("faceit_nick") or "",
                             p["elo"] if p.get("elo") is not None else "не найден",
@@ -629,8 +705,12 @@ def elo_text(p):
 def text_table(res):
     lines = []
     for t in res["teams"]:
+        if not t["players"]:
+            lines.append("%s - %s" % (t["name"], t.get("note") or "игроки не найдены"))
+            continue
         elos = " ".join(elo_text(p) for p in t["players"])
-        lines.append("%s - %s (%s)" % (t["name"], elos, t["avg"] if t["avg"] else "?"))
+        extra = "  [состав FACEIT-команды «%s»]" % t["faceit_team"]["name"] if t.get("faceit_team") else ""
+        lines.append("%s - %s (%s)%s" % (t["name"], elos, t["avg"] if t["avg"] else "?", extra))
     return "\n".join(lines)
 
 
@@ -666,7 +746,8 @@ def page(body, refresh=False):
 def form_html(value=""):
     return ('<h1>FACEIT Elo участников турнира CS2</h1>'
             '<div class="mut">Вставьте ссылку на турнир с Liquipedia или HLTV — или список команд текстом, '
-            'по строке на команду: <b>Команда: игрок1, игрок2, …</b> Для проверки без интернета — слово <b>demo</b>.</div>'
+            'по строке на команду: <b>Команда: игрок1, игрок2, …</b> Если ники неизвестны — просто <b>название команды</b>: '
+            'состав найдётся на FACEIT. Для проверки без интернета — слово <b>demo</b>.</div>'
             '<form method="post" action="/run"><textarea name="url" rows="3" autofocus '
             'placeholder="https://liquipedia.net/counterstrike/...&#10;или&#10;Natus Vincere: Aleksib, iM, b1t, w0nderful, makazze">%s</textarea>'
             '<button>Проверить</button></form>' % html.escape(value))
@@ -693,8 +774,20 @@ def result_html(res):
             else:
                 why = (' <span class="mut" title="%s">ⓘ</span>' % e(p["why"])) if p.get("why") else ""
                 cells.append('<tr class="miss"><td>%s</td><td class=n>не найден%s</td></tr>' % (e(p["name"]), why))
-        cards.append('<div class="card"><table><tr><th>%s</th><th class=n>%s</th></tr>%s</table></div>' % (
-            e(t["name"]), ("сред. %s" % t["avg"]) if t["avg"] else "—", "".join(cells)))
+        src = ""
+        ft = t.get("faceit_team")
+        if ft:
+            tlink = lambda x: '<a href="https://www.faceit.com/ru/teams/%s" target="_blank">%s</a>' % (e(x["id"]), e(x["name"]))
+            src = "состав с FACEIT: " + tlink(ft) + " (может включать запасных)"
+            if ft["alts"]:
+                src += "; ещё с таким названием: " + ", ".join(
+                    "%s (%d)" % (tlink(a), a["n"]) for a in ft["alts"])
+        elif t.get("note"):
+            src = t["note"]
+        if src:
+            src = '<tr><td colspan=2 class="tag">%s</td></tr>' % src
+        cards.append('<div class="card"><table><tr><th>%s</th><th class=n>%s</th></tr>%s%s</table></div>' % (
+            e(t["name"]), ("сред. %s" % t["avg"]) if t["avg"] else "—", src, "".join(cells)))
     unsure = (" · ещё %d найдено только по нику (~, в среднее не входят)" % res["unsure"]) if res.get("unsure") else ""
     return ('<h2>%s</h2><div class="mut">Эло найдено у %d из %d игроков%s · %s · таблица сохранена: %s</div>'
             '<div class="grid" style="margin-top:12px">%s</div>'
